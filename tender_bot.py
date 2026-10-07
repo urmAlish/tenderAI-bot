@@ -1,21 +1,23 @@
 """
 Бот для мониторинга тендеров на zakupki.gov.kg.
 Заходит на список объявлений, отбирает нужные по типу и сумме,
-и присылает НОВЫЕ в Telegram.
+открывает страницу каждого тендера и присылает НОВЫЕ в Telegram.
 """
+
 import html
 import json
+import math
 import os
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 
 import requests
 from bs4 import BeautifulSoup
 
 # ==================== НАСТРОЙКИ (меняйте только здесь) ====================
 
-MIN_SUM = 50_000          # минимальная сумма, сом
-MAX_SUM = 1_000_000       # максимальная сумма, сом
+MIN_SUM = 50_000      # минимальная сумма, сом
 
 # Ключевые слова. Пустой список = присылать ВСЕ товарные тендеры в диапазоне.
 # Пример: ["мебель", "канцеляр", "компьютер", "принтер"]
@@ -35,6 +37,8 @@ LIST_URL = "https://zakupki.gov.kg/popp/view/order/list.xhtml"
 VIEW_URL = "https://zakupki.gov.kg/popp/view/order/view.xhtml?id={}"
 SEEN_FILE = "seen.json"
 MAX_SEEN = 3000
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+BISHKEK = timezone(timedelta(hours=6))
 
 # Подписи на сайте (английская и русская версии)
 RE_TYPE = r"(?:Type of procurement|Вид закупки)"
@@ -42,13 +46,46 @@ RE_NAME = r"(?:purchase Name|Наименование закупки)"
 RE_COMPANY = r"(?:Name of company|Наименование организации|Закупающая организация)"
 RE_AMOUNT = r"(?:Planned amount|Планируемая сумма|Запланированная сумма)"
 RE_DEADLINE = r"(?:Bids Submission Deadline|Срок подачи[^\d]*)"
+
 NUMBER = r"\d{1,3}(?:[ ,\u00a0]\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?"
+
+MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+    "december": 12,
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11,
+    "декабря": 12,
+}
 
 
 def to_number(s):
     s = s.replace("\u00a0", "").replace(" ", "").replace(",", "")
     try:
         return float(s)
+    except ValueError:
+        return None
+
+
+def parse_date(s):
+    """Понимает '09.10.2026 14:23' и '09 October 2026 14:23'."""
+    if not s:
+        return None
+    s = s.strip()
+    m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(\d{1,2}):(\d{2}))?", s)
+    if m:
+        d, mo, y, h, mi = m.groups()
+    else:
+        m = re.search(r"(\d{1,2})\s+([A-Za-zА-Яа-я]+)\s+(\d{4})(?:\s+(\d{1,2}):(\d{2}))?", s)
+        if not m:
+            return None
+        d, mon, y, h, mi = m.groups()
+        mo = MONTHS.get(mon.lower())
+        if not mo:
+            return None
+    try:
+        return datetime(int(y), int(mo), int(d), int(h or 0), int(mi or 0),
+                        tzinfo=BISHKEK)
     except ValueError:
         return None
 
@@ -84,7 +121,6 @@ def parse_row(tid, text):
     # Срок подачи
     m = re.search(RE_DEADLINE + r"\s*(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})", text, re.I)
     t["deadline"] = m.group(1) if m else ""
-
     return t
 
 
@@ -104,10 +140,78 @@ def parse(page_html):
     return list(found.values())
 
 
+# ---------- страница самого тендера ----------
+
+def after_label(text, label_regex):
+    """Берёт значение после подписи: на той же строке или на следующей."""
+    m = re.search(label_regex + r"[ \t]*\n?[ \t]*([^\n]+)", text, re.I)
+    if not m:
+        return ""
+    value = m.group(1).strip()
+    if value.startswith("???") or not value:
+        return ""
+    return value
+
+
+def clean_delivery_term(s):
+    """'в течении 3-х дней со дня подписания контракта' -> 'в течении 3-х дней'"""
+    s = re.sub(
+        r"\s*(?:со дня|с дня|с момента|с даты|после|от даты|от дня)\b.*$",
+        "", s, flags=re.I)
+    return s.strip(" ,.;")
+
+
+def parse_gopp(text):
+    """Возвращает (есть_гопп: True/False/None, значение)."""
+    m = re.search(
+        r"(?:Guarantee provision of the tender bid|"
+        r"(?:Гарантийное\s+)?обеспечени\w+\s+(?:конкурсной\s+)?заявки)",
+        text, re.I)
+    if not m:
+        return None, ""
+    window = text[m.end(): m.end() + 300]
+    # обрезаем, когда начинается другой блок
+    window = re.split(r"\?\?\?bidSecurityValidity|Official information|Официальное",
+                      window, maxsplit=1)[0]
+    v = re.search(r"\((?:GOKZ|ГОКЗ|ГОПП)\)\s*:?\s*(\d[\d\s.,]*\s*(?:%|сом|som|KGS)?)",
+                  window, re.I)
+    if v:
+        return True, " ".join(v.group(1).split())
+    if re.search(r"declaration|деклараци", window, re.I):
+        return False, ""
+    return None, ""
+
+
+def fetch_details(tid):
+    """Открывает страницу тендера и достаёт нужные поля. Не падает при ошибке."""
+    d = {"published": None, "deadline": None, "address": "", "delivery": "",
+         "gopp": None, "gopp_value": ""}
+    try:
+        r = requests.get(VIEW_URL.format(tid), headers=HEADERS, timeout=60)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text("\n", strip=True)
+
+        d["published"] = parse_date(after_label(
+            text, r"(?:Date of publication|Дата публикации)"))
+        d["deadline"] = parse_date(after_label(
+            text, r"(?:Bids Submission Deadline|Срок подачи заявок?)"))
+        d["address"] = after_label(
+            text, r"(?:Address and place of delivery|Адрес и место поставки)")
+        d["delivery"] = clean_delivery_term(after_label(
+            text, r"(?:Terms of delivery of goods|Срок поставки(?: товара| товаров)?)"))
+        d["gopp"], d["gopp_value"] = parse_gopp(text)
+    except Exception as e:  # сайт не ответил, вёрстка другая и т.д.
+        print("Не удалось прочитать страницу тендера {}: {}".format(tid, e))
+    return d
+
+
+# ---------- фильтр и сообщение ----------
+
 def matches(t):
     if not t["is_goods"]:
         return False
-    if t["amount"] is None or not (MIN_SUM <= t["amount"] <= MAX_SUM):
+    if t["amount"] is None or t["amount"] < MIN_SUM:
         return False
     name = t["name"].lower()
     if KEYWORDS and not any(k.lower() in name for k in KEYWORDS):
@@ -117,13 +221,56 @@ def matches(t):
     return True
 
 
-def format_message(t):
-    lines = ["🆕 <b>" + html.escape(t["name"]) + "</b>"]
-    if t["company"]:
-        lines.append("🏢 " + html.escape(t["company"]))
-    lines.append("💰 {:,.0f} сом".format(t["amount"]).replace(",", " "))
-    if t["deadline"]:
-        lines.append("⏰ Подача до: " + t["deadline"])
+def plural_days(n):
+    if n % 10 == 1 and n % 100 != 11:
+        return "день"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return "дня"
+    return "дней"
+
+
+def left_text(deadline):
+    if not deadline:
+        return ""
+    delta = deadline - datetime.now(BISHKEK)
+    if delta.total_seconds() <= 0:
+        return "срок истёк"
+    if delta < timedelta(days=1):
+        hours = max(1, math.ceil(delta.total_seconds() / 3600))
+        return "осталось {} ч".format(hours)
+    days = delta.days
+    return "осталось {} {}".format(days, plural_days(days))
+
+
+def format_message(t, d):
+    e = html.escape
+    dash = "—"
+    lines = ["🍥 " + e(t["name"])]
+    lines.append("🏢 " + e(t["company"] or dash))
+    lines.append("")
+    lines.append("📍 " + e(d["address"] or dash))
+    lines.append("")
+    lines.append("🚛 Срок поставки: " + e(d["delivery"] or dash))
+    lines.append("")
+    if d["gopp"] is True:
+        lines.append("🧾 ГОПП: ✅ " + e(d["gopp_value"]))
+    elif d["gopp"] is False:
+        lines.append("🧾 ГОПП: ❌")
+    else:
+        lines.append("🧾 ГОПП: " + dash)
+    lines.append("")
+    lines.append("💸 <b>{:,.0f} сом</b>".format(t["amount"]).replace(",", " "))
+    lines.append("")
+
+    deadline = d["deadline"] or parse_date(t["deadline"])
+    start = d["published"].strftime("%d.%m") if d["published"] else dash
+    end = deadline.strftime("%d.%m") if deadline else dash
+    left = left_text(deadline)
+    date_line = "📅 от {} — до {}".format(start, end)
+    if left:
+        date_line += " ({})".format(left)
+    lines.append(date_line)
+    lines.append("")
     lines.append("🔗 " + VIEW_URL.format(t["id"]))
     return "\n".join(lines)
 
@@ -156,11 +303,7 @@ def main():
     if not token or not chat_id:
         sys.exit("Не заданы TELEGRAM_TOKEN и TELEGRAM_CHAT_ID")
 
-    resp = requests.get(
-        LIST_URL,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-        timeout=60,
-    )
+    resp = requests.get(LIST_URL, headers=HEADERS, timeout=60)
     resp.raise_for_status()
     tenders = parse(resp.text)
     if not tenders:
@@ -183,7 +326,8 @@ def main():
 
     # самые старые отправляем первыми
     for t in reversed(to_send):
-        send(token, chat_id, format_message(t))
+        details = fetch_details(t["id"])
+        send(token, chat_id, format_message(t, details))
 
     seen.extend(t["id"] for t in reversed(new))
     save_seen(seen)
